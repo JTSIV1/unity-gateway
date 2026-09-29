@@ -30,6 +30,11 @@ keyboard selection: nothing is selected by default, selecting Codex installs onl
 Codex, and submitting an empty selection installs nothing. Rendering checks cover
 the selected and empty checkboxes. These are local component checks, not live gateway tests.
 
+`test_claude_smart_routing_v2.py` checks plugin-qualified names, exact model
+definitions, and temporary plugin loading in both routing modes. Existing launch
+tests cover caller argument preservation and file removal after exit. These checks
+do not cover plugin-write/process-start failures, native plugin refresh, or daemon behavior.
+
 ## CUJ coverage matrix
 
 These are **implemented assertions**, not a claim that every version passes.
@@ -82,7 +87,7 @@ All tests live directly in `integration/`; shared mechanics live in `utils/`.
 | `test_ug_and_ucode_auth_helpers_emit_only_the_supplied_bearer` | Run both auth helper commands with the public bearer override, with and without forced refresh | Exact token-only stdout, no warnings or ANSI escapes; no workspace authentication or saved state |
 | `test_ug_and_ucode_web_search_helpers_preserve_mcp_stdio` | Initialize and list tools through both web-search helper commands | Exactly the MCP JSON-RPC responses; no text/ANSI contamination; existing server/tool identities preserved; no model request |
 
-With both agents selected there are **60 live cases** (12 interactive TUI cases),
+With both agents selected there are **61 live cases** (12 marked TUI cases),
 **6 managed-workspace cases** (marker `managed`, run against workspaces that
 publish a CodingAgentConfig), **1 two-workspace case** (marker `workspace_switch`),
 **25 managed-fixture cases** (marker `managed_fixture`, with only
@@ -130,7 +135,7 @@ dependency graph to reproduce a user's combination. Every relevant same-reposito
 PR and push to `main` runs both smoke and the full CUJ suite. Smoke covers the
 Databricks Hosted configure/TUI, custom OAuth CLI TUI, and headless argument
 journeys for both agents, in two parallel jobs. After smoke finishes, the full
-suite runs all 60 live cases across two parallel agent jobs: one Claude VM and one
+suite runs all 61 live cases across two parallel agent jobs: one Claude VM and one
 Codex VM, each running its configure, headless, and commands/lifecycle cases
 serially. Each agent is installed once for the full suite, and no two full jobs
 for the same agent overlap within a run.
@@ -186,7 +191,7 @@ These are unit/component checks; they do not establish live sudo password-prompt
 | Fresh provider/parent validation and mixed Bedrock filtering | Not covered after removing the duplicate model-discovery suites |
 | TUI initial prompt supplied on the launch command line | Not yet covered; headless prompt arguments are covered |
 | Follow-up turns and conversation resume | Not covered; reopen proves startup, not conversation resume |
-| Claude/Codex interactive smart routing | First-prompt routing covered by the `managed_fixture` smart-routing banner journeys; subagent routing covered at the hook protocol level by the route-subagent hook journeys, which drive the real installed hook commands with a harness-shaped payload against the live router; the subagent-only launch journeys assert the first-prompt banner and routing wrappers stay silent while the routing hooks arm. The agent's interactive spawn decision, interactive explicit-model bypass, and dedicated routing CI shards remain deferred. Unit/component routing tests do not establish live routing behavior. |
+| Claude/Codex interactive smart routing | First-prompt routing covered by the `managed_fixture` smart-routing banner journeys; subagent routing covered at the hook protocol level by the route-subagent hook journeys. Interactive spawning, plugin-refresh survival, native daemon/background dispatch, interactive explicit-model bypass, and dedicated routing CI shards remain deferred. Unit/component routing tests do not establish live routing behavior. |
 | Full allow/deny tool-permission matrix | Not covered; onboarding/trust uses actual TUI choices |
 | Desktop Codex app, Isaac itself, auto-upgrades | Not covered by command forwarding or pinned-version tests |
 | Native macOS/Windows live TUI, managed settings, resize/signals | Windows fresh-install, CLI, local helpers, and the Claude headless gateway journey are advisory; Codex Windows CI is blocked on npm proxy access. Live PTY/TUI, managed settings, and signal behavior still need separate platform implementation and coverage |
