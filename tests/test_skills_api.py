@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -223,18 +224,48 @@ class TestListSkillFiles:
         assert captured["url"] == f"{WS}/api/2.0/fs/directories/Skills/main/default/triage"
         assert captured["max_retries"] == sa._FILES_API_MAX_RETRIES
 
-    def test_walks_nested_directories_into_relative_paths(self, monkeypatch):
-        # The Files API returns absolute paths.
+    def test_flat_skill_returns_all_files(self, monkeypatch):
+        skill = "/Skills/main/default/triage"
+        monkeypatch.setattr(
+            sa,
+            "_http_get_json",
+            lambda url, token, **kwargs: (
+                {
+                    "contents": [
+                        {"path": f"{skill}/SKILL.md", "is_directory": False},
+                        {"path": f"{skill}/README.md", "is_directory": False},
+                        {"path": f"{skill}/config.yaml", "is_directory": False},
+                    ]
+                },
+                None,
+            ),
+        )
+
+        paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert reason is None
+        assert set(paths) == {"SKILL.md", "README.md", "config.yaml"}
+
+    def test_nested_tree_returns_all_files_across_levels(self, monkeypatch):
         skill = "/Skills/main/default/triage"
         listings = {
             "Skills/main/default/triage": {
                 "contents": [
                     {"path": f"{skill}/SKILL.md", "is_directory": False},
+                    {"path": f"{skill}/agents/", "is_directory": True},
                     {"path": f"{skill}/references/", "is_directory": True},
                 ]
             },
+            "Skills/main/default/triage/agents": {
+                "contents": [
+                    {"path": f"{skill}/agents/main.py", "is_directory": False},
+                ]
+            },
             "Skills/main/default/triage/references": {
-                "contents": [{"path": f"{skill}/references/primary.md", "is_directory": False}]
+                "contents": [
+                    {"path": f"{skill}/references/primary.md", "is_directory": False},
+                    {"path": f"{skill}/references/secondary.md", "is_directory": False},
+                ]
             },
         }
 
@@ -247,9 +278,14 @@ class TestListSkillFiles:
         paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
 
         assert reason is None
-        assert sorted(paths) == ["SKILL.md", "references/primary.md"]
+        assert set(paths) == {
+            "SKILL.md",
+            "agents/main.py",
+            "references/primary.md",
+            "references/secondary.md",
+        }
 
-    def test_follows_pagination(self, monkeypatch):
+    def test_pagination_collects_files_from_all_pages(self, monkeypatch):
         skill = "/Skills/main/default/triage"
         pages = [
             {
@@ -264,9 +300,9 @@ class TestListSkillFiles:
         paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
 
         assert reason is None
-        assert sorted(paths) == ["a.md", "b.md"]
+        assert set(paths) == {"a.md", "b.md"}
 
-    def test_http_failure_propagates_reason(self, monkeypatch):
+    def test_any_directory_failure_returns_empty_and_reason(self, monkeypatch):
         monkeypatch.setattr(
             sa, "_http_get_json", lambda url, token, **kwargs: (None, "HTTP 404 Not Found")
         )
@@ -275,6 +311,163 @@ class TestListSkillFiles:
 
         assert paths == []
         assert reason == "HTTP 404 Not Found"
+
+    def test_one_subdir_failure_aborts_whole_listing(self, monkeypatch):
+        skill = "/Skills/main/default/triage"
+        listings = {
+            "Skills/main/default/triage": {
+                "contents": [
+                    {"path": f"{skill}/agents/", "is_directory": True},
+                    {"path": f"{skill}/broken/", "is_directory": True},
+                ]
+            },
+            "Skills/main/default/triage/agents": {
+                "contents": [{"path": f"{skill}/agents/main.py", "is_directory": False}]
+            },
+        }
+
+        def fake_get(url, token, **kwargs):
+            directory = url.split("/api/2.0/fs/directories/", 1)[1]
+            if directory not in listings:
+                return None, "HTTP 500 Server Error"
+            return listings[directory], None
+
+        monkeypatch.setattr(sa, "_http_get_json", fake_get)
+
+        paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert paths == []
+        assert reason == "HTTP 500 Server Error"
+
+    def test_three_level_deep_tree_returns_all_files(self, monkeypatch):
+        skill = "/Skills/main/default/triage"
+        listings = {
+            "Skills/main/default/triage": {
+                "contents": [
+                    {"path": f"{skill}/SKILL.md", "is_directory": False},
+                    {"path": f"{skill}/agents/", "is_directory": True},
+                ]
+            },
+            "Skills/main/default/triage/agents": {
+                "contents": [
+                    {"path": f"{skill}/agents/main.py", "is_directory": False},
+                    {"path": f"{skill}/agents/tools/", "is_directory": True},
+                ]
+            },
+            "Skills/main/default/triage/agents/tools": {
+                "contents": [
+                    {"path": f"{skill}/agents/tools/search.py", "is_directory": False},
+                ]
+            },
+        }
+
+        def fake_get(url, token, **kwargs):
+            directory = url.split("/api/2.0/fs/directories/", 1)[1]
+            return listings[directory], None
+
+        monkeypatch.setattr(sa, "_http_get_json", fake_get)
+
+        paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert reason is None
+        assert set(paths) == {"SKILL.md", "agents/main.py", "agents/tools/search.py"}
+
+    def test_wave_three_failure_discards_partial_results(self, monkeypatch):
+        skill = "/Skills/main/default/triage"
+        listings = {
+            "Skills/main/default/triage": {
+                "contents": [
+                    {"path": f"{skill}/a/", "is_directory": True},
+                    {"path": f"{skill}/b/", "is_directory": True},
+                ]
+            },
+            "Skills/main/default/triage/a": {
+                "contents": [
+                    {"path": f"{skill}/a/file.md", "is_directory": False},
+                    {"path": f"{skill}/a/deep/", "is_directory": True},
+                ]
+            },
+            "Skills/main/default/triage/b": {
+                "contents": [
+                    {"path": f"{skill}/b/file.md", "is_directory": False},
+                    {"path": f"{skill}/b/deep/", "is_directory": True},
+                ]
+            },
+            "Skills/main/default/triage/a/deep": {
+                "contents": [{"path": f"{skill}/a/deep/ok.md", "is_directory": False}]
+            },
+        }
+
+        def fake_get(url, token, **kwargs):
+            directory = url.split("/api/2.0/fs/directories/", 1)[1]
+            if directory not in listings:
+                return None, "HTTP 500 Server Error"
+            return listings[directory], None
+
+        monkeypatch.setattr(sa, "_http_get_json", fake_get)
+
+        paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert paths == []
+        assert reason == "HTTP 500 Server Error"
+
+    def test_concurrency_cap_not_exceeded_during_listing(self, monkeypatch):
+        skill = "/Skills/main/default/triage"
+        subdirs = [f"dir_{i}" for i in range(40)]
+        root_contents = [{"path": f"{skill}/{d}/", "is_directory": True} for d in subdirs]
+
+        counter_lock = threading.Lock()
+        state = {"in_flight": 0, "peak": 0}
+
+        def fake_get(url, token, **kwargs):
+            if "Skills/main/default/triage" in url and not any(f"/{d}" in url for d in subdirs):
+                return {"contents": root_contents}, None
+            with counter_lock:
+                state["in_flight"] += 1
+                state["peak"] = max(state["peak"], state["in_flight"])
+            time.sleep(0.002)
+            with counter_lock:
+                state["in_flight"] -= 1
+            return {"contents": []}, None
+
+        monkeypatch.setattr(sa, "_http_get_json", fake_get)
+
+        paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert reason is None
+        assert paths == []
+        assert state["peak"] <= sa._MAX_CONCURRENT_FILES_API_REQUESTS
+
+    def test_queued_listings_are_cancelled_after_a_failure(self, monkeypatch):
+        skill = "/Skills/main/default/triage"
+        subdirs = ["fail"] + [f"dir_{i}" for i in range(6)]
+        root_listing = {
+            "contents": [{"path": f"{skill}/{d}/", "is_directory": True} for d in subdirs]
+        }
+        release = threading.Event()
+        started = []
+
+        def fake_get(url, token, **kwargs):
+            directory = url.split("/api/2.0/fs/directories/", 1)[1]
+            if directory == "Skills/main/default/triage":
+                return root_listing, None
+            if directory.endswith("/fail"):
+                return None, "HTTP 429"
+            started.append(directory)
+            release.wait()
+            return {"contents": []}, None
+
+        pool = ThreadPoolExecutor(max_workers=2)
+        monkeypatch.setattr(sa, "_files_api_pool", pool)
+        monkeypatch.setattr(sa, "_http_get_json", fake_get)
+        try:
+            result = sa.list_skill_files(WS, "token", "main", "default", "triage")
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
+        assert result == ([], "HTTP 429")
+        assert len(started) <= 2
 
 
 class TestFetchSkillFile:
@@ -407,7 +600,7 @@ class TestFetchSkillBundle:
 
         assert reason is None
         assert len(bundle) == 50
-        assert state["max_in_flight"] <= sa._MAX_CONCURRENT_FILE_DOWNLOADS
+        assert state["max_in_flight"] <= sa._MAX_CONCURRENT_FILES_API_REQUESTS
 
     def test_failure_returns_before_blocked_fetches_complete(self, monkeypatch):
         blocker = threading.Event()
@@ -441,37 +634,30 @@ class TestFetchSkillBundle:
             blocker.set()
             t.join()
 
-    def test_fetches_waiting_for_a_slot_skip_after_a_failure(self, monkeypatch):
-        paths = [f"file_{i}.md" for i in range(5)]
+    def test_queued_fetches_are_cancelled_after_a_failure(self, monkeypatch):
+        paths = ["fail.md"] + [f"file_{i}.md" for i in range(6)]
+        release = threading.Event()
+        started = []
+
+        def fake_fetch(ws, tok, c, s, leaf, rel):
+            if rel == "fail.md":
+                return None, "HTTP 429"
+            started.append(rel)
+            release.wait()
+            return b"data", None
+
+        pool = ThreadPoolExecutor(max_workers=2)
+        monkeypatch.setattr(sa, "_files_api_pool", pool)
         monkeypatch.setattr(sa, "list_skill_files", lambda *a, **k: (paths, None))
-        fetched = []
-        monkeypatch.setattr(
-            sa,
-            "fetch_skill_file",
-            lambda ws, tok, c, s, leaf, rel: fetched.append(rel) or (None, "HTTP 429"),
-        )
-
-        all_waiting = threading.Barrier(len(paths), timeout=2.0)
-        bundle_returned = threading.Event()
-        released = threading.Semaphore(0)
-
-        class OneSlotUntilBundleReturns:
-            def __enter__(self):
-                if all_waiting.wait():
-                    bundle_returned.wait()
-
-            def __exit__(self, *exc):
-                released.release()
-
-        monkeypatch.setattr(sa, "_file_download_slots", OneSlotUntilBundleReturns())
-
-        result = sa.fetch_skill_bundle(WS, "token", "main", "default", "triage")
-        bundle_returned.set()
-        for _ in paths:
-            assert released.acquire(timeout=2.0)
+        monkeypatch.setattr(sa, "fetch_skill_file", fake_fetch)
+        try:
+            result = sa.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
 
         assert result == (None, "HTTP 429")
-        assert len(fetched) == 1
+        assert len(started) <= 2
 
 
 class TestGetSkill:

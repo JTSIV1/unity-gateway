@@ -26,8 +26,10 @@ from ucode.ui import print_warning
 SKILL_FILES_API_PREFIX = "Skills"
 
 _FILES_API_MAX_RETRIES = 2
-_MAX_CONCURRENT_FILE_DOWNLOADS = 24
-_file_download_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_FILE_DOWNLOADS)
+_MAX_CONCURRENT_FILES_API_REQUESTS = 24
+_files_api_pool = ThreadPoolExecutor(
+    max_workers=_MAX_CONCURRENT_FILES_API_REQUESTS, thread_name_prefix="files-api"
+)
 
 # Wall-clock budget for the workspace-wide skill walk; a slow workspace degrades
 # to partial results instead of hanging the picker.
@@ -215,14 +217,42 @@ def list_all_skills(
     return refs, None
 
 
+def _list_skill_directory(
+    dirs_base: str, directory: str, token: str, skill_prefix: str
+) -> tuple[list[str], list[str], str | None]:
+    files: list[str] = []
+    subdirs: list[str] = []
+    page_token: str | None = None
+    while True:
+        url = f"{dirs_base}/{directory}"
+        if page_token:
+            url = f"{url}?{urlencode({'page_token': page_token})}"
+        payload, reason = _http_get_json(url, token, timeout=30, max_retries=_FILES_API_MAX_RETRIES)
+        if payload is None:
+            return [], [], reason
+        data = payload if isinstance(payload, dict) else {}
+        for entry in data.get("contents") or []:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(path, str):
+                continue
+            if entry.get("is_directory"):
+                subdirs.append(path.strip("/"))
+            else:
+                files.append(path.removeprefix(skill_prefix))
+        page_token = data.get("next_page_token")
+        if not page_token:
+            return files, subdirs, None
+
+
 def list_skill_files(
     workspace: str, token: str, catalog: str, schema: str, securable: str
 ) -> tuple[list[str], str | None]:
     """List a skill bundle's files, as paths relative to the skill directory.
 
-    Recursively walks the skill's Files API directory (including ``SKILL.md``).
-    Takes the securable leaf, the only name the Files API resolves. A non-None
-    reason indicates the listing call itself failed.
+    Walks the skill's Files API directory tree concurrently (one wave of
+    sibling directories per level). Takes the securable leaf, the only name
+    the Files API resolves. A non-None reason indicates the listing call
+    itself failed; the returned path order is non-deterministic.
     """
     hostname = workspace_hostname(workspace)
     dirs_base = f"https://{hostname}/api/2.0/fs/directories"
@@ -231,29 +261,21 @@ def list_skill_files(
     relative_paths: list[str] = []
     pending = [f"{SKILL_FILES_API_PREFIX}/{catalog}/{schema}/{securable}"]
     while pending:
-        directory = pending.pop()
-        page_token: str | None = None
-        while True:
-            url = f"{dirs_base}/{directory}"
-            if page_token:
-                url = f"{url}?{urlencode({'page_token': page_token})}"
-            payload, reason = _http_get_json(
-                url, token, timeout=30, max_retries=_FILES_API_MAX_RETRIES
-            )
-            if payload is None:
-                return [], reason
-            data = payload if isinstance(payload, dict) else {}
-            for entry in data.get("contents") or []:
-                path = entry.get("path") if isinstance(entry, dict) else None
-                if not isinstance(path, str):
-                    continue
-                if entry.get("is_directory"):
-                    pending.append(path.strip("/"))
-                else:
-                    relative_paths.append(path.removeprefix(skill_prefix))
-            page_token = data.get("next_page_token")
-            if not page_token:
-                break
+        futures = [
+            _files_api_pool.submit(_list_skill_directory, dirs_base, directory, token, skill_prefix)
+            for directory in pending
+        ]
+        pending = []
+        try:
+            for future in as_completed(futures):
+                files, subdirs, reason = future.result()
+                if reason:
+                    return [], reason
+                relative_paths.extend(files)
+                pending.extend(subdirs)
+        finally:
+            for future in futures:
+                future.cancel()
     return relative_paths, None
 
 
@@ -282,25 +304,20 @@ def fetch_skill_bundle(
     if reason:
         return None, reason
 
-    abandoned = threading.Event()
-
-    def fetch(path: str) -> tuple[str, tuple[bytes | None, str | None]]:
-        with _file_download_slots:
-            if abandoned.is_set():
-                return path, (None, None)
-            return path, fetch_skill_file(workspace, token, catalog, schema, securable, path)
-
+    path_by_future = {
+        _files_api_pool.submit(
+            fetch_skill_file, workspace, token, catalog, schema, securable, path
+        ): path
+        for path in relative_paths
+    }
     bundle: dict[str, bytes] = {}
-    pool = ThreadPoolExecutor(
-        max_workers=max(1, min(_MAX_CONCURRENT_FILE_DOWNLOADS, len(relative_paths)))
-    )
     try:
-        for future in as_completed([pool.submit(fetch, path) for path in relative_paths]):
-            path, (content, file_reason) = future.result()
+        for future in as_completed(path_by_future):
+            content, file_reason = future.result()
             if content is None:
                 return None, file_reason
-            bundle[path] = content
+            bundle[path_by_future[future]] = content
         return bundle, None
     finally:
-        abandoned.set()
-        pool.shutdown(wait=False, cancel_futures=True)
+        for future in path_by_future:
+            future.cancel()
