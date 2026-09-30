@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 import ucode.skills_api as sa
@@ -209,8 +212,8 @@ class TestListSkillFiles:
     def test_lists_under_the_skills_place(self, monkeypatch):
         captured = {}
 
-        def fake_get(url, token, timeout=30):
-            captured["url"] = url
+        def fake_get(url, token, **kwargs):
+            captured.update(url=url, **kwargs)
             return {"contents": []}, None
 
         monkeypatch.setattr(sa, "_http_get_json", fake_get)
@@ -218,6 +221,7 @@ class TestListSkillFiles:
         sa.list_skill_files(WS, "token", "main", "default", "triage")
 
         assert captured["url"] == f"{WS}/api/2.0/fs/directories/Skills/main/default/triage"
+        assert captured["max_retries"] == sa._FILES_API_MAX_RETRIES
 
     def test_walks_nested_directories_into_relative_paths(self, monkeypatch):
         # The Files API returns absolute paths.
@@ -234,7 +238,7 @@ class TestListSkillFiles:
             },
         }
 
-        def fake_get(url, token, timeout=30):
+        def fake_get(url, token, **kwargs):
             directory = url.split("/api/2.0/fs/directories/", 1)[1]
             return listings[directory], None
 
@@ -255,9 +259,7 @@ class TestListSkillFiles:
             {"contents": [{"path": f"{skill}/b.md", "is_directory": False}]},
         ]
 
-        monkeypatch.setattr(
-            sa, "_http_get_json", lambda url, token, timeout=30: (pages.pop(0), None)
-        )
+        monkeypatch.setattr(sa, "_http_get_json", lambda url, token, **kwargs: (pages.pop(0), None))
 
         paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
 
@@ -266,7 +268,7 @@ class TestListSkillFiles:
 
     def test_http_failure_propagates_reason(self, monkeypatch):
         monkeypatch.setattr(
-            sa, "_http_get_json", lambda url, token, timeout=30: (None, "HTTP 404 Not Found")
+            sa, "_http_get_json", lambda url, token, **kwargs: (None, "HTTP 404 Not Found")
         )
 
         paths, reason = sa.list_skill_files(WS, "token", "main", "default", "triage")
@@ -279,8 +281,8 @@ class TestFetchSkillFile:
     def test_returns_raw_bytes_from_files_api(self, monkeypatch):
         captured = {}
 
-        def fake_get_bytes(url, token, timeout=30):
-            captured["url"] = url
+        def fake_get_bytes(url, token, **kwargs):
+            captured.update(url=url, **kwargs)
             return b"# SKILL\n", None
 
         monkeypatch.setattr(sa, "_http_get_bytes", fake_get_bytes)
@@ -290,10 +292,11 @@ class TestFetchSkillFile:
         assert reason is None
         assert body == b"# SKILL\n"
         assert captured["url"] == f"{WS}/api/2.0/fs/files/Skills/main/default/triage/SKILL.md"
+        assert captured["max_retries"] == sa._FILES_API_MAX_RETRIES
 
     def test_http_failure_propagates_reason(self, monkeypatch):
         monkeypatch.setattr(
-            sa, "_http_get_bytes", lambda url, token, timeout=30: (None, "HTTP 404 Not Found")
+            sa, "_http_get_bytes", lambda url, token, **kwargs: (None, "HTTP 404 Not Found")
         )
 
         body, reason = sa.fetch_skill_file(WS, "token", "main", "default", "triage", "gone.md")
@@ -339,6 +342,136 @@ class TestFetchSkillBundle:
 
         assert bundle is None
         assert reason == "HTTP 500 Server Error"
+
+    def test_concurrent_bundle_assembles_correctly(self, monkeypatch):
+        paths = [f"file_{i}.md" for i in range(10)]
+        content_map = {p: f"content {i}".encode() for i, p in enumerate(paths)}
+        monkeypatch.setattr(sa, "list_skill_files", lambda *a, **k: (paths, None))
+        monkeypatch.setattr(
+            sa, "fetch_skill_file", lambda ws, tok, c, s, leaf, rel: (content_map[rel], None)
+        )
+
+        bundle, reason = sa.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+
+        assert reason is None
+        assert bundle == content_map
+
+    def test_any_file_failure_returns_none_not_partial(self, monkeypatch):
+        paths = ["a.md", "b.md", "c.md", "bad.md"]
+        monkeypatch.setattr(sa, "list_skill_files", lambda *a, **k: (paths, None))
+        monkeypatch.setattr(
+            sa,
+            "fetch_skill_file",
+            lambda ws, tok, c, s, leaf, rel: (
+                (None, "HTTP 500") if rel == "bad.md" else (b"ok", None)
+            ),
+        )
+
+        bundle, reason = sa.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+
+        assert bundle is None
+        assert reason == "HTTP 500"
+
+    def test_listing_failure_does_not_call_fetch(self, monkeypatch):
+        fetched = []
+        monkeypatch.setattr(sa, "list_skill_files", lambda *a, **k: ([], "listing failed"))
+        monkeypatch.setattr(
+            sa, "fetch_skill_file", lambda *a, **k: fetched.append(a) or (b"x", None)
+        )
+
+        bundle, reason = sa.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+
+        assert bundle is None
+        assert reason == "listing failed"
+        assert fetched == []
+
+    def test_concurrency_cap_never_exceeded(self, monkeypatch):
+        paths = [f"file_{i}.md" for i in range(50)]
+        monkeypatch.setattr(sa, "list_skill_files", lambda *a, **k: (paths, None))
+
+        counter_lock = threading.Lock()
+        state = {"in_flight": 0, "max_in_flight": 0}
+
+        def fake_fetch(ws, tok, c, s, leaf, rel):
+            with counter_lock:
+                state["in_flight"] += 1
+                state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+            time.sleep(0.005)
+            with counter_lock:
+                state["in_flight"] -= 1
+            return b"data", None
+
+        monkeypatch.setattr(sa, "fetch_skill_file", fake_fetch)
+
+        bundle, reason = sa.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+
+        assert reason is None
+        assert len(bundle) == 50
+        assert state["max_in_flight"] <= sa._MAX_CONCURRENT_FILE_DOWNLOADS
+
+    def test_failure_returns_before_blocked_fetches_complete(self, monkeypatch):
+        blocker = threading.Event()
+        paths = ["fail.md", "slow_a.md", "slow_b.md"]
+        monkeypatch.setattr(sa, "list_skill_files", lambda *a, **k: (paths, None))
+
+        def fake_fetch(ws, tok, c, s, leaf, rel):
+            if rel == "fail.md":
+                return None, "HTTP 500"
+            blocker.wait()
+            return b"data", None
+
+        monkeypatch.setattr(sa, "fetch_skill_file", fake_fetch)
+
+        result = [None]
+
+        def run():
+            result[0] = sa.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+
+        t = threading.Thread(target=run)
+        t.start()
+        try:
+            t.join(timeout=2.0)
+            assert not t.is_alive(), (
+                "fetch_skill_bundle did not return within 2s — fast-fail broken"
+            )
+            bundle, reason = result[0]
+            assert bundle is None
+            assert reason == "HTTP 500"
+        finally:
+            blocker.set()
+            t.join()
+
+    def test_fetches_waiting_for_a_slot_skip_after_a_failure(self, monkeypatch):
+        paths = [f"file_{i}.md" for i in range(5)]
+        monkeypatch.setattr(sa, "list_skill_files", lambda *a, **k: (paths, None))
+        fetched = []
+        monkeypatch.setattr(
+            sa,
+            "fetch_skill_file",
+            lambda ws, tok, c, s, leaf, rel: fetched.append(rel) or (None, "HTTP 429"),
+        )
+
+        all_waiting = threading.Barrier(len(paths), timeout=2.0)
+        bundle_returned = threading.Event()
+        released = threading.Semaphore(0)
+
+        class OneSlotUntilBundleReturns:
+            def __enter__(self):
+                if all_waiting.wait():
+                    bundle_returned.wait()
+
+            def __exit__(self, *exc):
+                released.release()
+
+        monkeypatch.setattr(sa, "_file_download_slots", OneSlotUntilBundleReturns())
+
+        result = sa.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+        bundle_returned.set()
+        for _ in paths:
+            assert released.acquire(timeout=2.0)
+
+        assert result == (None, "HTTP 429")
+        assert len(fetched) == 1
 
 
 class TestGetSkill:
