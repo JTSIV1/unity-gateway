@@ -125,6 +125,58 @@ def test_headless_only_is_allowed_on_windows_with_live_workspace_and_auth():
     assert args.pytest_args == ["-m", "live"]
 
 
+def test_cuj_suite_uses_test_owned_workspaces():
+    args = runner.arguments(
+        ["--suite", "e2e-cuj", "--claude-version", "2.1.280", "--codex-version", "0.154.0"],
+        platform_name="posix",
+        environment={"UCODE_TEST_WORKSPACE": "https://unrelated-integration-workspace.test"},
+    )
+
+    assert args.suite == "e2e-cuj"
+    assert args.workspace is None
+    assert args.pytest_args == ["-m", "cuj"]
+
+
+def test_cuj_suite_forwards_only_explicit_auth_and_workspace_inputs():
+    runtime = {"PATH": "isolated", "DATABRICKS_BEARER": "generated"}
+    source = {
+        "DATABRICKS_BEARER": "local-bearer",
+        "UG_CUJ_SP_CLIENT_ID": "client-id",
+        "UG_CUJ_SP_CLIENT_SECRET": "client-secret",
+        "UG_CUJ1_WORKSPACE": "https://cuj.test",
+        "UNRELATED_SECRET": "must-not-cross-boundary",
+    }
+
+    environment = runner.suite_test_environment("e2e-cuj", runtime, source)
+
+    assert environment == {
+        "PATH": "isolated",
+        "DATABRICKS_BEARER": "local-bearer",
+        "UG_CUJ_SP_CLIENT_ID": "client-id",
+        "UG_CUJ_SP_CLIENT_SECRET": "client-secret",
+        "UG_CUJ1_WORKSPACE": "https://cuj.test",
+    }
+    assert runner.suite_test_environment("integration", runtime, source) == runtime
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--installation-only"],
+        ["--headless-only"],
+        ["--workspace", "https://unrelated-integration-workspace.test"],
+        ["--profile", "unrelated-integration-profile"],
+    ],
+)
+def test_cuj_suite_rejects_integration_only_options(options):
+    with pytest.raises(SystemExit):
+        runner.arguments(
+            ["--suite", "e2e-cuj", "--claude-version", "2.1.280", *options],
+            platform_name="posix",
+            environment={},
+        )
+
+
 def test_windows_policy_paths_match_pinned_agent_locations():
     paths = runner.managed_policy_paths(
         ["claude", "codex"],
