@@ -2482,6 +2482,146 @@ class TestClaudeLaunch:
         settings = json.loads(calls[0][2])
         assert settings["env"]["ANTHROPIC_MODEL"] == "cat.schema.model"
 
+    def test_managed_family_alias_uses_configured_model_without_native_alias(
+        self, monkeypatch, tmp_path
+    ):
+        calls: list[list[str]] = []
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text(
+            json.dumps({"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]"}})
+        )
+        monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", settings_path)
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch(
+            {
+                "workspace": WS,
+                MANAGED_OVERLAY_KEY: {"claude_models": {"opus": "developer-opus"}},
+            },
+            [],
+            options=LaunchOptions(user_pinned_model="opus"),
+        )
+
+        assert os.environ["ANTHROPIC_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        launch_settings = json.loads(calls[0][2])
+        assert launch_settings["env"]["ANTHROPIC_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        assert "--model" not in calls[0]
+
+    def test_launch_boundary_managed_family_alias_uses_actual_model(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch(
+            {"workspace": WS},
+            [],
+            options=LaunchOptions(
+                user_pinned_model="opus",
+                managed_claude_model="system.ai.claude-opus-4-8",
+            ),
+        )
+
+        assert os.environ["ANTHROPIC_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        launch_settings = json.loads(calls[0][2])
+        assert launch_settings["env"]["ANTHROPIC_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        assert "--model" not in calls[0]
+
+    def test_managed_parent_overrides_stale_provider_for_forwarded_alias(
+        self, monkeypatch, tmp_path
+    ):
+        calls: list[list[str]] = []
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text(
+            json.dumps({"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]"}})
+        )
+        monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", settings_path)
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch(
+            {
+                "workspace": WS,
+                "provider_services": {"claude": "main.default.stale"},
+                "_claude_launch_parent_schema": "main.models",
+                MANAGED_OVERLAY_KEY: {"claude_models": {"opus": "developer-opus"}},
+            },
+            ["--model", "opus"],
+            options=LaunchOptions(user_pinned_model="opus"),
+        )
+
+        assert os.environ["ANTHROPIC_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        launch_settings = json.loads(calls[0][2])
+        assert launch_settings["env"]["ANTHROPIC_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        assert "--model" not in calls[0]
+
+    def test_equal_managed_family_value_still_marks_managed_alias(self, monkeypatch, tmp_path):
+        calls: list[list[str]] = []
+        settings_path = tmp_path / "ucode-settings.json"
+        monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", settings_path)
+        monkeypatch.setattr(claude, "CLAUDE_BACKUP_PATH", tmp_path / "backup.json")
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(
+            claude,
+            "write_json_file",
+            lambda path, payload: path.write_text(json.dumps(payload)),
+        )
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+        state = {
+            "workspace": WS,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+        }
+
+        claude.write_tool_config(
+            state,
+            "system.ai.claude-opus-4-8",
+            coding_agent_config_defaults={"opus": "system.ai.claude-opus-4-8"},
+        )
+        claude.launch(state, [], options=LaunchOptions(user_pinned_model="opus"))
+
+        assert state[MANAGED_OVERLAY_KEY]["claude_models"] == state["claude_models"]
+        launch_settings = json.loads(calls[0][2])
+        assert launch_settings["env"]["ANTHROPIC_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        assert "--model" not in calls[0]
+
+    def test_unmanaged_family_alias_keeps_native_alias(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch(
+            {"workspace": WS},
+            [],
+            options=LaunchOptions(user_pinned_model="opus"),
+        )
+
+        assert os.environ["ANTHROPIC_MODEL"] == "opus"
+        assert calls[0][-2:] == ["--model", "opus"]
+
+    def test_provider_family_alias_keeps_native_alias(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch(
+            {
+                "workspace": WS,
+                "_claude_launch_provider": "main.default.anthropic",
+                MANAGED_OVERLAY_KEY: {"claude_models": {"opus": "managed-opus"}},
+            },
+            [],
+            options=LaunchOptions(user_pinned_model="opus"),
+        )
+
+        assert os.environ["ANTHROPIC_MODEL"] == "opus"
+        assert calls[0][-2:] == ["--model", "opus"]
+
     def test_launch_default_model_is_inherited_by_smart_routing(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_DEFAULT_MODEL", raising=False)
         monkeypatch.setattr(v2, "launch_claude", Mock())

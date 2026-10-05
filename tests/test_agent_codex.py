@@ -9,9 +9,11 @@ from unittest.mock import Mock
 
 import pytest
 
+import ucode.state as state_mod
 from ucode import managed_files
 from ucode.agents import LaunchOptions, codex
 from ucode.config_io import read_toml_safe
+from ucode.managed_resolve import resolve_state
 from ucode.smart_routing import codex_routing
 
 WS = "https://example.databricks.com"
@@ -909,15 +911,38 @@ class TestCodexDefaultModel:
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", tmp_path / "ucode.config.toml")
         monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
 
-    def test_clears_profile_model_preferences(self, tmp_path):
+    def test_configure_clears_profile_model_preferences(self, tmp_path, monkeypatch):
         codex.CODEX_CONFIG_PATH.write_text(
             'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\n', encoding="utf-8"
         )
+        monkeypatch.setattr(codex, "agent_version", lambda _: "0.145.0")
+        monkeypatch.setattr(codex, "save_state", lambda _: None)
 
-        assert codex.default_model({"codex_models": ["system.ai.gpt-5-6-luna"]}) is None
+        codex.write_tool_config({"workspace": WS, "codex_models": ["system.ai.gpt-5-6-luna"]})
+
         doc = read_toml_safe(codex.CODEX_CONFIG_PATH)
         assert "model" not in doc
         assert "model_reasoning_effort" not in doc
+
+    def test_managed_default_survives_saved_state_hydration(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(codex, "agent_version", lambda _: "0.145.0")
+        state_dir = tmp_path / ".ucode"
+        monkeypatch.setattr(state_mod, "APP_DIR", state_dir)
+        monkeypatch.setattr(state_mod, "STATE_PATH", state_dir / "state.json")
+        developer_state = {
+            "workspace": WS,
+            "codex_models": ["system.ai.gpt-5-6-luna"],
+        }
+        managed = {
+            "enabled_agents": {"codex": {"model_config": {"default_model": "admin-chosen-default"}}}
+        }
+        resolved = resolve_state(managed, developer_state, "codex")
+
+        codex.write_tool_config(resolved)
+
+        assert read_toml_safe(codex.CODEX_CONFIG_PATH)["model"] == "admin-chosen-default"
+        persisted = state_mod.load_full_state()["workspaces"][WS]
+        assert "codex_default_model" not in persisted
 
     def test_none_when_no_configured_model(self):
         assert codex.default_model({}) is None

@@ -1266,6 +1266,12 @@ def write_tool_config(
     # this launch's warm managed-config cache (no extra round trip); a failed fetch degrades to None
     # (treated as unmanaged), never blocking the write.
     managed_config_present = refresh_managed_config(state).manifest is not None
+    if coding_agent_config_defaults:
+        managed_overlay = state.get(MANAGED_OVERLAY_KEY)
+        if not isinstance(managed_overlay, dict):
+            managed_overlay = {}
+            state[MANAGED_OVERLAY_KEY] = managed_overlay
+        managed_overlay.setdefault("claude_models", state.get("claude_models"))
     previous_keys = ((state.get("managed_configs") or {}).get("claude") or {}).get("keys", [])
     web_search_model = _resolve_web_search_model(state)
     should_write_tracing_settings = (
@@ -1827,6 +1833,47 @@ def _launch_model_args(tool_args: list[str], launch_model: str | None) -> list[s
     return ["--model", launch_model]
 
 
+def _managed_family_alias_model(state: dict, model: str | None) -> str | None:
+    """Resolve a managed family alias without losing its context-window suffix."""
+    family_env_key = CLAUDE_DEFAULT_MODEL_ENV_KEYS.get(model or "")
+    if family_env_key is None:
+        return None
+    provider_services = state.get("provider_services")
+    if state.get("_claude_launch_provider") or (
+        not state.get("_claude_launch_parent_schema")
+        and isinstance(provider_services, dict)
+        and provider_services.get("claude")
+    ):
+        return None
+    overlay = state.get(MANAGED_OVERLAY_KEY)
+    if not isinstance(overlay, dict):
+        return None
+    if "claude_models" not in overlay and "claude_static_models" not in overlay:
+        return None
+    env = read_json_safe(CLAUDE_SETTINGS_PATH).get("env")
+    if not isinstance(env, dict):
+        return None
+    configured_model = env.get(family_env_key)
+    return configured_model if isinstance(configured_model, str) and configured_model else None
+
+
+def _without_model_args(tool_args: list[str]) -> list[str]:
+    """Remove forwarded Claude model flags after a managed family alias is resolved."""
+    remaining: list[str] = []
+    index = 0
+    while index < len(tool_args):
+        arg = tool_args[index]
+        if arg in {"--model", "-m"} and index + 1 < len(tool_args):
+            index += 2
+            continue
+        if arg.startswith("--model="):
+            index += 1
+            continue
+        remaining.append(arg)
+        index += 1
+    return remaining
+
+
 def _resolve_picker_model_id(model: str, settings_env: dict) -> str:
     """Resolve configured aliases and context suffixes for comparisons only."""
     model = re.sub(r"\[(?:1m|200k)\]$", "", model)
@@ -2064,12 +2111,21 @@ def launch(
     settings_override = None
     launch_args = list(tool_args)
     if options.user_pinned_model:
-        os.environ["ANTHROPIC_MODEL"] = options.user_pinned_model
-        settings_override = {"env": {"ANTHROPIC_MODEL": options.user_pinned_model}}
-        launch_args = [
-            *_launch_model_args(tool_args, options.user_pinned_model),
-            *tool_args,
-        ]
+        managed_alias_model = options.managed_claude_model or _managed_family_alias_model(
+            state, options.user_pinned_model
+        )
+        launch_model = managed_alias_model or options.user_pinned_model
+        if options.managed_claude_model and not launch_model.endswith(("[1m]", "[200k]")):
+            launch_model = _maybe_add_1m_suffix(launch_model)
+        os.environ["ANTHROPIC_MODEL"] = launch_model
+        settings_override = {"env": {"ANTHROPIC_MODEL": launch_model}}
+        if managed_alias_model:
+            launch_args = _without_model_args(tool_args)
+        else:
+            launch_args = [
+                *_launch_model_args(tool_args, options.user_pinned_model),
+                *tool_args,
+            ]
     else:
         picker_models = state.get("_claude_launch_picker_models")
         if isinstance(picker_models, list) and picker_models:

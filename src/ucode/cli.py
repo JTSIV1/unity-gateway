@@ -2551,10 +2551,12 @@ def _launch_options(
     explicit_prompt: bool,
     user_pinned_model: str | None,
     provider: str | None,
+    managed_claude_model: str | None = None,
 ) -> LaunchOptions:
     return LaunchOptions(
         # Pinned models for providers are resolved above through the provider-specific launch path.
         user_pinned_model=user_pinned_model if provider is None else None,
+        managed_claude_model=managed_claude_model if provider is None else None,
         launch_smart_routing=(
             # Smart routing is enabled globally.
             smart_routing_enabled
@@ -2928,6 +2930,8 @@ def _launch_tool(
         if tool == "claude":
             if provider:
                 state["_claude_launch_provider"] = provider
+            elif parent_schema:
+                state["_claude_launch_parent_schema"] = parent_schema
         elif tool == "codex":
             if provider:
                 state["_codex_launch_provider"] = provider
@@ -2942,6 +2946,11 @@ def _launch_tool(
             # initial/fallback model and still participates in a routed session.
             user_pinned_model=model or forwarded_model,
             provider=provider,
+            managed_claude_model=(
+                coding_agent_config_defaults.get(model)
+                if tool == "claude" and model and coding_agent_config_defaults
+                else None
+            ),
         )
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         with _smart_routing_v2_flag(

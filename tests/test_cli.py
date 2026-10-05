@@ -1484,6 +1484,47 @@ class TestClaudeModelFlag:
             mock_launch.call_args.kwargs["options"].user_pinned_model == "cat.schema.claude-opus-5"
         )
 
+    def test_managed_family_alias_resolves_at_launch_boundary(self):
+        managed = {
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "default_models_by_model_family": {
+                            "default_opus_model": "system.ai.claude-opus-4-8"
+                        }
+                    }
+                }
+            }
+        }
+
+        with _launch_policy_patches(managed) as calls:
+            result = runner.invoke(app, ["claude", "--model", "opus"])
+
+        assert result.exit_code == 0, result.output
+        options = calls["launch"].call_args.kwargs["options"]
+        assert options.user_pinned_model == "opus"
+        assert options.managed_claude_model == "system.ai.claude-opus-4-8"
+        assert calls["launch"].call_args.args[2] == []
+
+    def test_managed_parent_marks_active_source_for_forwarded_alias(self):
+        managed = {
+            "enabled_agents": {
+                "claude": {"model_config": {"unity_catalog_location": "main.models"}}
+            }
+        }
+
+        with _launch_policy_patches(managed, persisted_provider="main.default.stale") as calls:
+            calls["state"]["provider_services"] = {"claude": "main.default.stale"}
+            result = runner.invoke(app, ["claude", "--", "--model", "opus"])
+
+        assert result.exit_code == 0, result.output
+        launch_state = calls["launch"].call_args.args[1]
+        assert launch_state["_claude_launch_parent_schema"] == "main.models"
+        options = calls["launch"].call_args.kwargs["options"]
+        assert options.user_pinned_model == "opus"
+        assert options.managed_claude_model is None
+        assert calls["launch"].call_args.args[2] == ["--model", "opus"]
+
     def test_v2_model_sets_transient_launch_override(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
         state = {**MINIMAL_STATE, "claude_models": {"opus": "system.ai.claude-opus-4-8"}}
