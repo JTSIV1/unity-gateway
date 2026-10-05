@@ -71,7 +71,7 @@ def test_integration_ci_gate_requires_selected_managed_jobs(suite, managed_resul
     assert script is not None
     results = {
         job: {"result": "success"}
-        for job in ("installation", "workspace", "smoke", "full", "managed")
+        for job in ("installation", "workspace", "smoke", "full", "managed", "cuj1")
     }
     results["managed"]["result"] = managed_result
     for job in {
@@ -93,6 +93,50 @@ def test_integration_ci_gate_requires_selected_managed_jobs(suite, managed_resul
     else:
         assert result.returncode == 0, result.stderr
         assert "All selected integration jobs passed:" in result.stdout
+
+
+def test_cuj1_ci_uses_scaffold_suite_and_shared_credentials():
+    workflow = Path(__file__).parent.parent / ".github/workflows/integration.yml"
+    job = workflow.read_text().split("\n  cuj1:\n", 1)[1].split("\n  cujs:\n", 1)[0]
+    assert "secrets.UG_CUJ1_WORKSPACE" in job
+    assert "secrets.UG_CUJ_SP_CLIENT_ID" in job
+    assert "secrets.UG_CUJ_SP_CLIENT_SECRET" in job
+    assert "--suite e2e-cuj" in job
+    assert "-- -m cuj" in job
+    assert "continue-on-error:" not in job
+
+
+@pytest.mark.parametrize("suite", ["full", "live", "smoke", "tui", "installation"])
+@pytest.mark.parametrize("cuj1_result", ["success", "failure", "cancelled", "skipped"])
+def test_integration_ci_gate_requires_selected_cuj1_job(suite, cuj1_result):
+    workflow = Path(__file__).parent.parent / ".github/workflows/integration.yml"
+    gate = workflow.read_text().split("\n  cujs:\n", 1)[1]
+    assert "cuj1" in gate.split("needs: [", 1)[1].split("]", 1)[0]
+    script = re.search(r"          python3 - <<'PY'\n(.*?)          PY", gate, re.DOTALL)
+    assert script is not None
+    results = {
+        job: {"result": "success"}
+        for job in ("installation", "workspace", "smoke", "full", "managed", "cuj1")
+    }
+    results["cuj1"]["result"] = cuj1_result
+    for job in {
+        "installation": ("workspace", "smoke", "full"),
+        "smoke": ("full",),
+        "tui": ("smoke",),
+    }.get(suite, ()):
+        results[job]["result"] = "skipped"
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script.group(1))],
+        env={"RESULTS": json.dumps(results), "SUITE": suite},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if suite in {"full", "live"} and cuj1_result != "success":
+        assert result.returncode != 0
+        assert "Integration jobs did not pass: cuj1" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
 
 
 def test_integration_suite_uses_only_public_process_boundaries():
