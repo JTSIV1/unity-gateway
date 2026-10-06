@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import time
 import tomllib
 import uuid
@@ -54,56 +53,6 @@ def _claude_picker_visible(text: str) -> bool:
     return selected_model_row and _claude_models_visible(text)
 
 
-def _install_claude_recorder_launcher(session, recorder_base_url: str) -> None:
-    """Route the real Claude launch through a disposable settings copy."""
-    wrapper_dir = session.home / ".ucode" / "e2e-claude-recorder-bin"
-    wrapper_dir.mkdir(parents=True, exist_ok=True)
-    original_path = session.env["PATH"]
-    claude_binary = shutil.which("claude", path=original_path)
-    assert claude_binary, original_path
-    script = f"""#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
-import sys
-
-CLAUDE_BINARY = {json.dumps(claude_binary)}
-RECORDER_BASE_URL = {json.dumps(recorder_base_url)}
-OVERRIDE_DIR = Path({json.dumps(str(wrapper_dir))})
-
-args = sys.argv[1:]
-try:
-    settings_index = args.index("--settings")
-except ValueError:
-    settings_index = -1
-if settings_index >= 0:
-    if settings_index + 1 >= len(args):
-        raise SystemExit("Claude recorder launcher received --settings without a value")
-    settings_value = args[settings_index + 1]
-    if settings_value.lstrip().startswith("{{"):
-        settings = json.loads(settings_value)
-        inline = True
-    else:
-        settings = json.loads(Path(settings_value).read_text(encoding="utf-8"))
-        inline = False
-    settings_env = settings.setdefault("env", {{}})
-    if not isinstance(settings_env, dict):
-        raise SystemExit("Claude settings env must be an object")
-    settings_env["ANTHROPIC_BASE_URL"] = RECORDER_BASE_URL
-    if inline:
-        args[settings_index + 1] = json.dumps(settings, separators=(",", ":"))
-    else:
-        override_path = OVERRIDE_DIR / ("settings-" + str(os.getpid()) + ".json")
-        override_path.write_text(json.dumps(settings), encoding="utf-8")
-        args[settings_index + 1] = str(override_path)
-os.execv(CLAUDE_BINARY, [CLAUDE_BINARY, *args])
-"""
-    launcher = wrapper_dir / "claude"
-    launcher.write_text(script, encoding="utf-8")
-    launcher.chmod(0o755)
-    session.env["PATH"] = os.pathsep.join((str(wrapper_dir), original_path))
-
-
 def _assert_inference_requests(
     recorder: TuiRequestRecorder,
     checkpoint: int,
@@ -138,10 +87,13 @@ def _assert_inference_requests(
         assert isinstance(payload.get("model"), str), sorted(payload)
         if marker in json.dumps(payload):
             marked_requests += 1
-        if recorder.response_for(request).status_code == 200:
-            served_models.append(payload["model"])
+            if recorder.response_for(request).status_code == 200:
+                served_models.append(payload["model"])
     assert marked_requests >= 2, marked_requests
-    assert expected_model in served_models, served_models
+    expected = re.sub(r"\[(?:1m|200k)\]$", "", expected_model)
+    assert (
+        sum(re.sub(r"\[(?:1m|200k)\]$", "", model) == expected for model in served_models) >= 2
+    ), served_models
 
 
 def _managed_config(session) -> dict:
@@ -225,6 +177,7 @@ def _assert_generated_configs(session, claude_headers: dict[str, str], workspace
     claude_settings = json.loads(claude_settings_path.read_text())
     # AIGTWY-4876: Each agent picker exposes exactly its configured model list.
     assert claude_settings["availableModels"] == CLAUDE_MODELS, claude_settings
+    assert claude_settings["enforceAvailableModels"] is True, claude_settings
     claude_picker = claude_settings["modelPicker"]
     assert claude_picker["replaceBuiltInOptions"] is True, claude_settings
     assert claude_picker["options"] == [
@@ -485,32 +438,30 @@ class TestCujManagedClaude(BaseCujTest):
         """
         session = live_session
         workspace = self.WORKSPACE_URL
-        configured = session.run(
-            "configure",
-            "--workspace",
-            workspace,
-            "--skip-upgrade",
-            timeout=300,
-        )
-        assert "Select coding agents to configure:" not in configured.stdout, configured.stdout
-
-        raw = _managed_config(session)
-        entries = _managed_entries(raw)
-        claude = entries["CODING_AGENT_CLAUDE_CODE"]
-        claude_headers = _assert_published_config(raw, entries)
-        assert claude["models"] == {"model_services": CLAUDE_MODELS}, claude
-        assert claude["default_models"] == CLAUDE_DEFAULTS, claude
-        assert claude_headers["x-ug-e2e-agent"] == "claude", claude_headers
-
-        claude_settings_path = session.home / ".claude" / "ucode-settings.json"
-        settings = json.loads(claude_settings_path.read_text())
-        assert settings["env"]["ANTHROPIC_BASE_URL"] == (f"{workspace}/ai-gateway/anthropic"), (
-            settings
-        )
-        run_id = claude_headers["x-ug-e2e-run"]
-
         with TuiRequestRecorder(workspace) as recorder:
-            _install_claude_recorder_launcher(session, f"{recorder.url}/ai-gateway/anthropic")
+            configured = session.run(
+                "configure",
+                "--workspace",
+                recorder.url,
+                "--skip-upgrade",
+                timeout=300,
+            )
+            assert "Select coding agents to configure:" not in configured.stdout, configured.stdout
+
+            raw = _managed_config(session)
+            entries = _managed_entries(raw)
+            claude = entries["CODING_AGENT_CLAUDE_CODE"]
+            claude_headers = _assert_published_config(raw, entries)
+            assert claude["models"] == {"model_services": CLAUDE_MODELS}, claude
+            assert claude["default_models"] == CLAUDE_DEFAULTS, claude
+            assert claude_headers["x-ug-e2e-agent"] == "claude", claude_headers
+
+            claude_settings_path = session.home / ".claude" / "ucode-settings.json"
+            settings = json.loads(claude_settings_path.read_text())
+            assert settings["env"]["ANTHROPIC_BASE_URL"] == (
+                f"{recorder.url}/ai-gateway/anthropic"
+            ), settings
+            run_id = claude_headers["x-ug-e2e-run"]
 
             root_task = FileTask(session)
             root_marker = f"ug-managed-claude-{uuid.uuid4().hex}-root"
@@ -615,13 +566,13 @@ class TestCujManagedClaude(BaseCujTest):
                 "claude",
                 CLAUDE_DEFAULTS["default_haiku_model"],
             )
-        final_settings = json.loads(claude_settings_path.read_text())
-        assert final_settings["env"]["ANTHROPIC_BASE_URL"] == (
-            f"{workspace}/ai-gateway/anthropic"
-        ), final_settings
-        assert _claude_header_lines(final_settings["env"]["ANTHROPIC_CUSTOM_HEADERS"]) == (
-            claude_headers
-        ), final_settings
+            final_settings = json.loads(claude_settings_path.read_text())
+            assert final_settings["env"]["ANTHROPIC_BASE_URL"] == (
+                f"{recorder.url}/ai-gateway/anthropic"
+            ), final_settings
+            assert _claude_header_lines(final_settings["env"]["ANTHROPIC_CUSTOM_HEADERS"]) == (
+                claude_headers
+            ), final_settings
 
 
 class TestCujManagedCodex(BaseCujTest):
@@ -635,36 +586,34 @@ class TestCujManagedCodex(BaseCujTest):
         """
         session = live_session
         workspace = self.WORKSPACE_URL
-        configured = session.run(
-            "configure",
-            "--workspace",
-            workspace,
-            "--skip-upgrade",
-            timeout=300,
-        )
-        assert "Select coding agents to configure:" not in configured.stdout, configured.stdout
-
-        raw = _managed_config(session)
-        entries = _managed_entries(raw)
-        codex = entries["CODING_AGENT_CODEX"]
-        claude_headers = _assert_published_config(raw, entries)
-        assert codex["models"] == {"model_services": CODEX_MODELS}, codex
-        assert codex["default_models"] == {"default_model": CODEX_DEFAULT}, codex
-        assert _normalized_headers(codex["http_headers"])["x-ug-e2e-agent"] == "codex", codex
-        codex_models = session.codex_model_ids(
-            ["app-server", "--listen", "stdio://"], name="managed-codex-models"
-        )
-        assert codex_models == CODEX_MODELS, codex_models
-
-        profile = tomllib.loads((session.home / ".codex" / "ucode.config.toml").read_text())
-        assert profile["model_providers"]["Databricks"]["base_url"] == (
-            f"{workspace}/ai-gateway/codex/v1"
-        ), profile
-        run_id = claude_headers["x-ug-e2e-run"]
-        session.env.pop("OTEL_RESOURCE_ATTRIBUTES", None)
-
         with TuiRequestRecorder(workspace) as recorder:
-            recorder_base_url = f"{recorder.url}/ai-gateway/codex/v1"
+            configured = session.run(
+                "configure",
+                "--workspace",
+                recorder.url,
+                "--skip-upgrade",
+                timeout=300,
+            )
+            assert "Select coding agents to configure:" not in configured.stdout, configured.stdout
+
+            raw = _managed_config(session)
+            entries = _managed_entries(raw)
+            codex = entries["CODING_AGENT_CODEX"]
+            claude_headers = _assert_published_config(raw, entries)
+            assert codex["models"] == {"model_services": CODEX_MODELS}, codex
+            assert codex["default_models"] == {"default_model": CODEX_DEFAULT}, codex
+            assert _normalized_headers(codex["http_headers"])["x-ug-e2e-agent"] == "codex", codex
+            codex_models = session.codex_model_ids(
+                ["app-server", "--listen", "stdio://"], name="managed-codex-models"
+            )
+            assert codex_models == CODEX_MODELS, codex_models
+
+            profile = tomllib.loads((session.home / ".codex" / "ucode.config.toml").read_text())
+            assert profile["model_providers"]["Databricks"]["base_url"] == (
+                f"{recorder.url}/ai-gateway/codex/v1"
+            ), profile
+            run_id = claude_headers["x-ug-e2e-run"]
+            session.env.pop("OTEL_RESOURCE_ATTRIBUTES", None)
 
             codex_default_task = FileTask(session)
             codex_default_marker = f"ug-managed-codex-{uuid.uuid4().hex}-default"
@@ -676,8 +625,6 @@ class TestCujManagedCodex(BaseCujTest):
                     str(session.binary),
                     "codex",
                     "--",
-                    "--config",
-                    f'model_providers.Databricks.base_url="{recorder_base_url}"',
                     "--config",
                     f'otel.span_attributes.ug_integration_marker="{codex_default_marker}"',
                 ],
@@ -712,8 +659,6 @@ class TestCujManagedCodex(BaseCujTest):
                     "--",
                     "--model",
                     CODEX_LUNA,
-                    "--config",
-                    f'model_providers.Databricks.base_url="{recorder_base_url}"',
                     "--config",
                     f'otel.span_attributes.ug_integration_marker="{codex_luna_marker}"',
                 ],
